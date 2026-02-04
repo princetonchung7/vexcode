@@ -96,6 +96,10 @@ lemlib::Chassis chassis(drivetrain, linearController, angularController, sensors
  * to keep execution time for this mode under a few seconds.
  */
 
+int prevLeftPower  = 0;
+int prevRightPower = 0;
+
+const int SLEW_STEP = 8;
 
 void initialize() {
     pros::lcd::initialize();
@@ -175,17 +179,29 @@ void autonomous() {
 }
 
 
+int slew(int target, int current) {
+    if (target > current + SLEW_STEP)
+        return current + SLEW_STEP;
+    if (target < current - SLEW_STEP)
+        return current - SLEW_STEP;
+    return target;
+}
+
 void opcontrol() {
-       while (true) {
-  
+
+    prevLeftPower = 0;
+prevRightPower = 0;
+
+     while (true) {
+
         int leftY  = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
         int rightX = controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
 
-        
+        // deadband
         if (abs(leftY) < 5) leftY = 0;
         if (abs(rightX) < 5) rightX = 0;
 
-       
+        // intake controls
         if (controller.get_digital(DIGITAL_R2)) {
             spinIntake();
         } else if (controller.get_digital(DIGITAL_R1)) {
@@ -196,33 +212,35 @@ void opcontrol() {
             stopIntake();
         }
 
-       
+        // pistons
         if (controller.get_digital_new_press(DIGITAL_B)) {
             matchLoaderState = !matchLoaderState;
             matchLoader.set_value(matchLoaderState);
         }
 
-        
         if (controller.get_digital_new_press(DIGITAL_RIGHT)) {
             descoreState = !descoreState;
             descore.set_value(descoreState);
         }
 
-     
         if (controller.get_digital_new_press(DIGITAL_A)) {
             switchPistonState = !switchPistonState;
             switchPiston.set_value(switchPistonState);
         }
 
-       
-        int driveRPM = leftY * 600 / 127;
-        int turnRPM  = rightX * 600 / 127;
+        
+        int drivePower = leftY;
+        int turnPower  = rightX * abs(rightX) / 127 * 0.6;
 
-        int leftRPM  = driveRPM + turnRPM;
-        int rightRPM = driveRPM - turnRPM;
 
-        leftMotors.move_velocity(leftRPM);
-        rightMotors.move_velocity(rightRPM);
+        int leftPower  = drivePower + turnPower;
+        int rightPower = drivePower - turnPower;
+
+        revLeftPower  = slew(leftPower,  prevLeftPower);
+        prevRightPower = slew(rightPower, prevRightPower);
+
+        leftMotors.move(prevLeftPower);
+        rightMotors.move(prevRightPower);
 
         pros::delay(10);
     }
