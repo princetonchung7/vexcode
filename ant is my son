@@ -1,6 +1,11 @@
 #include "main.h"
 #include "lemlib/api.hpp" // IWYU pragma: keep
 
+double targetHeading = 0;
+bool headingAssistActive = false;
+
+// very small correction gain
+const double HEADING_KP = 1.2;
 // controller
 pros::Controller controller(pros::E_CONTROLLER_MASTER);
 
@@ -187,32 +192,41 @@ int slew(int target, int current) {
     return target;
 }
 
+
+
 void opcontrol() {
 
-    prevLeftPower = 0;
-prevRightPower = 0;
+   chassis.cancelAllMotions();
 
-     while (true) {
+    prevLeftPower = 0;
+    prevRightPower = 0;
+    headingAssistActive = false;
+
+    while (true) {
 
         int leftY  = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
         int rightX = controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
 
-        // deadband
+      
         if (abs(leftY) < 5) leftY = 0;
         if (abs(rightX) < 5) rightX = 0;
 
-        // intake controls
+    
         if (controller.get_digital(DIGITAL_R2)) {
-            spinIntake();
+            intakeMotor.move(-127);
+            outTakeMotor.move(127);
         } else if (controller.get_digital(DIGITAL_R1)) {
+            intakeMotor.move(0);
             outTakeMotor.move(-127);
         } else if (controller.get_digital(DIGITAL_L2)) {
             intakeMotor.move(127);
+            outTakeMotor.move(0);
         } else {
-            stopIntake();
+            intakeMotor.move(0);
+            outTakeMotor.move(0);
         }
 
-        // pistons
+    
         if (controller.get_digital_new_press(DIGITAL_B)) {
             matchLoaderState = !matchLoaderState;
             matchLoader.set_value(matchLoaderState);
@@ -228,15 +242,35 @@ prevRightPower = 0;
             switchPiston.set_value(switchPistonState);
         }
 
-        
-        int drivePower = leftY;
-        int turnPower  = rightX * abs(rightX) / 127 * 0.6;
+       int drivePower = leftY;
+double turnPower;
 
+// --- HEADING ASSIST LOGIC ---
+if (abs(rightX) < 5 && abs(leftY) > 5) {
+    // enable / maintain heading assist
+    if (!headingAssistActive) {
+        targetHeading = imu.get_heading();
+        headingAssistActive = true;
+    }
+
+    double headingError = targetHeading - imu.get_heading();
+
+    // wrap error to [-180, 180]
+    if (headingError > 180) headingError -= 360;
+    if (headingError < -180) headingError += 360;
+
+    turnPower = headingError * HEADING_KP;
+} else {
+    // driver is turning → disable assist
+    headingAssistActive = false;
+    turnPower = rightX * abs(rightX) / 127 * 0.6;
+}
 
         int leftPower  = drivePower + turnPower;
         int rightPower = drivePower - turnPower;
 
-        revLeftPower  = slew(leftPower,  prevLeftPower);
+        // Slew rate limiter
+        prevLeftPower  = slew(leftPower,  prevLeftPower);
         prevRightPower = slew(rightPower, prevRightPower);
 
         leftMotors.move(prevLeftPower);
