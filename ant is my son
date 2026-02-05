@@ -1,11 +1,12 @@
 #include "main.h"
 #include "lemlib/api.hpp" // IWYU pragma: keep
 
+const double HEADING_KD = 2;
 double targetHeading = 0;
 bool headingAssistActive = false;
 
 // very small correction gain
-const double HEADING_KP = 1.2;
+const double HEADING_KP = 5;
 // controller
 pros::Controller controller(pros::E_CONTROLLER_MASTER);
 
@@ -211,6 +212,15 @@ void opcontrol() {
         if (abs(leftY) < 5) leftY = 0;
         if (abs(rightX) < 5) rightX = 0;
 
+        static int lastLeftY = 0;
+
+        if ((lastLeftY == 0 && leftY != 0) ||
+        (lastLeftY != 0 && leftY == 0)) {
+        headingAssistActive = false;
+}
+
+lastLeftY = leftY;
+}
     
         if (controller.get_digital(DIGITAL_R2)) {
             intakeMotor.move(-127);
@@ -246,8 +256,9 @@ void opcontrol() {
 double turnPower;
 
 // --- HEADING ASSIST LOGIC ---
-if (abs(rightX) < 5 && abs(leftY) > 5) {
-    // enable / maintain heading assist
+if (abs(rightX) < 5 && abs(leftY) > 20 &&
+    abs(prevLeftPower - drivePower) < 5 &&
+    abs(prevRightPower - drivePower) < 5) {    
     if (!headingAssistActive) {
         targetHeading = imu.get_heading();
         headingAssistActive = true;
@@ -260,6 +271,9 @@ if (abs(rightX) < 5 && abs(leftY) > 5) {
     if (headingError < -180) headingError += 360;
 
     turnPower = headingError * HEADING_KP;
+
+if (turnPower > 20)  turnPower = 20;
+if (turnPower < -20) turnPower = -20;
 } else {
     // driver is turning → disable assist
     headingAssistActive = false;
