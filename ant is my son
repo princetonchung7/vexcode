@@ -1,25 +1,27 @@
 #include "main.h"
 #include "lemlib/api.hpp" // IWYU pragma: keep
 
-const double HEADING_KD = 2;
 double targetHeading = 0;
 bool headingAssistActive = false;
 
 // very small correction gain
 const double HEADING_KP = 5;
+
+// derivative gain
+const double HEADING_KD = 2;
+
 // controller
 pros::Controller controller(pros::E_CONTROLLER_MASTER);
 
 // motor groups
-pros::MotorGroup leftMotors({-12, -13, -14},
-pros::MotorGearset::blue); // left motor group - ports 3 (reversed), 4, 5 (reversed)
+pros::MotorGroup leftMotors({-12, -13, -14}, pros::MotorGearset::blue); // left motor group - ports 3 (reversed), 4, 5 (reversed)
 pros::MotorGroup rightMotors({1, 2, 3}, pros::MotorGearset::blue); // right motor group - ports 6, 7, 9 (reversed)
 
 // Inertial Sensor on port 10
 pros::Imu imu(10);
-pros::ADIDigitalOut switchPiston('B');
-pros::ADIDigitalOut matchLoader('A');
-pros::ADIDigitalOut descore('E');
+pros::adi::DigitalOut switchPiston('B');
+pros::adi::DigitalOut matchLoader('A');
+pros::adi::DigitalOut descore('E');
 pros::Motor intakeMotor(20);
 pros::Motor outTakeMotor(9);
 
@@ -110,9 +112,8 @@ const int SLEW_STEP = 8;
 void initialize() {
     pros::lcd::initialize();
 
-    
-    leftMotors.set_brake_modes(pros::E_MOTOR_BRAKE_COAST);
-    rightMotors.set_brake_modes(pros::E_MOTOR_BRAKE_COAST);
+    leftMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_COAST);
+    rightMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_COAST);
 
     lemlib::Pose poseA(53,-8,247);
     chassis.calibrate();
@@ -220,14 +221,13 @@ void opcontrol() {
 }
 
 lastLeftY = leftY;
-}
-    
+
         if (controller.get_digital(DIGITAL_R2)) {
             intakeMotor.move(-127);
             outTakeMotor.move(127);
         } else if (controller.get_digital(DIGITAL_R1)) {
-            intakeMotor.move(0);
-            outTakeMotor.move(-127);
+            intakeMotor.move(-127);
+            outTakeMotor.move(0);
         } else if (controller.get_digital(DIGITAL_L2)) {
             intakeMotor.move(127);
             outTakeMotor.move(0);
@@ -242,7 +242,7 @@ lastLeftY = leftY;
             matchLoader.set_value(matchLoaderState);
         }
 
-        if (controller.get_digital_new_press(DIGITAL_RIGHT)) {
+        if (controller.get_digital_new_press(DIGITAL_X)) {
             descoreState = !descoreState;
             descore.set_value(descoreState);
         }
