@@ -5,10 +5,10 @@ double targetHeading = 0;
 bool headingAssistActive = false;
 
 // very small correction gain
-const double HEADING_KP = 5;
+const double HEADING_KP = 2.0;
 
 // derivative gain
-const double HEADING_KD = 2;
+const double HEADING_KD = 5.0;
 
 // controller
 pros::Controller controller(pros::E_CONTROLLER_MASTER);
