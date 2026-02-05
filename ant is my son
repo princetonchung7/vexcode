@@ -4,11 +4,13 @@
 double targetHeading = 0;
 bool headingAssistActive = false;
 
+double lastHeadingError = 0;
+
 // very small correction gain
-const double HEADING_KP = 2.0;
+const double HEADING_KP = 1.2;
 
 // derivative gain
-const double HEADING_KD = 5.0;
+const double HEADING_KD = 4.5;
 
 // controller
 pros::Controller controller(pros::E_CONTROLLER_MASTER);
@@ -218,6 +220,7 @@ void opcontrol() {
         if ((lastLeftY == 0 && leftY != 0) ||
         (lastLeftY != 0 && leftY == 0)) {
         headingAssistActive = false;
+        lastHeadingError = 0;
 }
 
 lastLeftY = leftY;
@@ -256,9 +259,7 @@ lastLeftY = leftY;
 double turnPower;
 
 // --- HEADING ASSIST LOGIC ---
-if (abs(rightX) < 5 && abs(leftY) > 20 &&
-    abs(prevLeftPower - drivePower) < 5 &&
-    abs(prevRightPower - drivePower) < 5) {    
+if (abs(rightX) < 5 && abs(leftY) > 15) {   
     if (!headingAssistActive) {
         targetHeading = imu.get_heading();
         headingAssistActive = true;
@@ -270,14 +271,12 @@ if (abs(rightX) < 5 && abs(leftY) > 20 &&
     if (headingError > 180) headingError -= 360;
     if (headingError < -180) headingError += 360;
 
-    turnPower = headingError * HEADING_KP;
-
-if (turnPower > 20)  turnPower = 20;
-if (turnPower < -20) turnPower = -20;
+    double lastHeadingError = 0;
 } else {
     // driver is turning → disable assist
     headingAssistActive = false;
-    turnPower = rightX * abs(rightX) / 127 * 0.6;
+lastHeadingError = 0;
+turnPower = rightX * abs(rightX) / 127 * 0.6;
 }
 
         int leftPower  = drivePower + turnPower;
