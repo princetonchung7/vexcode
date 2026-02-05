@@ -255,8 +255,8 @@ lastLeftY = leftY;
             switchPiston.set_value(switchPistonState);
         }
 
-       int drivePower = leftY;
-double turnPower;
+      int drivePower = leftY;
+double turnPower = 0;
 
 // --- HEADING ASSIST LOGIC ---
 if (abs(rightX) < 5 && abs(leftY) > 15) {   
@@ -271,24 +271,17 @@ if (abs(rightX) < 5 && abs(leftY) > 15) {
     if (headingError > 180) headingError -= 360;
     if (headingError < -180) headingError += 360;
 
-    double lastHeadingError = 0;
+    // PD correction
+    double derivative = headingError - lastHeadingError;
+    turnPower = headingError * HEADING_KP + derivative * HEADING_KD;
+
+    lastHeadingError = headingError;
+
 } else {
     // driver is turning → disable assist
     headingAssistActive = false;
-lastHeadingError = 0;
-turnPower = rightX * abs(rightX) / 127 * 0.6;
-}
+    lastHeadingError = 0;
 
-        int leftPower  = drivePower + turnPower;
-        int rightPower = drivePower - turnPower;
-
-        // Slew rate limiter
-        prevLeftPower  = slew(leftPower,  prevLeftPower);
-        prevRightPower = slew(rightPower, prevRightPower);
-
-        leftMotors.move(prevLeftPower);
-        rightMotors.move(prevRightPower);
-
-        pros::delay(10);
-    }
+    // normal turning curve
+    turnPower = rightX * abs(rightX) / 127.0 * 0.6;
 }
