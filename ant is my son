@@ -1,307 +1,111 @@
 #include "main.h"
-#include "lemlib/api.hpp" // IWYU pragma: keep
 
-double targetHeading = 0;
-bool headingAssistActive = false;
-
-double lastHeadingError = 0;
-
-// very small correction gain
-const double HEADING_KP = 1.2;
-
-// derivative gain
-const double HEADING_KD = 1.5;
-
-// controller
 pros::Controller controller(pros::E_CONTROLLER_MASTER);
 
-// motor groups
-pros::MotorGroup leftMotors({-12, -13, -14}, pros::MotorGearset::blue); // left motor group - ports 3 (reversed), 4, 5 (reversed)
-pros::MotorGroup rightMotors({1, 2, 3}, pros::MotorGearset::blue); // right motor group - ports 6, 7, 9 (reversed)
+// ----- DRIVETRAIN ----- //
+pros::MotorGroup leftMotors({-12, -13, -14}, pros::MotorGearset::blue);
+pros::MotorGroup rightMotors({1, 2, 3}, pros::MotorGearset::blue, true); // reversed
 
-// Inertial Sensor on port 10
 pros::Imu imu(10);
+
+// ----- SUBSYSTEMS ----- //
+pros::Motor intakeMotor(20);
+pros::Motor outTakeMotor(9);
 pros::adi::DigitalOut switchPiston('B');
 pros::adi::DigitalOut matchLoader('A');
 pros::adi::DigitalOut descore('E');
-pros::Motor intakeMotor(20);
-pros::Motor outTakeMotor(9);
 
+// ----- SETTINGS ----- //
+const int DEADZONE = 10;
+const int MAX_SPEED = 127;
+const int SLEW_STEP = 6;    // smooth acceleration
+const double HEADING_KP = 0.5;
+const double HEADING_KD = 0.1;
 
-bool inverse = false;
-bool switchPistonState = false;
-bool matchLoaderState = false;
-bool descoreState = false;
+// optional multiplier if one side is slightly stronger
+const double DRIFT_COMP = 0.96;
 
-// tracking wheels
-// horizontal tracking wheel encoder. Rotation sensor, port 20, not reversed
-pros::Rotation horizontalEnc(-18);
-// vertical tracking wheel encoder. Rotation sensor, port 11, reversed
-pros::Rotation verticalEnc(-6);
-// horizontal tracking wheel. 2.75" diameter, 5.75" offset, back of the robot (negative)
-lemlib::TrackingWheel horizontal(&horizontalEnc, lemlib::Omniwheel::NEW_275, -5.75);
-// vertical tracking wheel. 2.75" diameter, 2.5" offset, left of the robot (negative)
-lemlib::TrackingWheel vertical(&verticalEnc, lemlib::Omniwheel::NEW_275, -2.5);
-
-// drivetrain settings
-lemlib::Drivetrain drivetrain(&leftMotors, // left motor group
-                              &rightMotors, // right motor group
-                              10, // 10 inch track width
-                              lemlib::Omniwheel::NEW_325, // using new 4" omnis
-                              360, // drivetrain rpm is 360
-                              2 // horizontal drift is 2. If we had traction wheels, it would have been 8
-);
-
-// lateral motion controller
-lemlib::ControllerSettings linearController(10, // proportional gain (kP)
-                                            0, // integral gain (kI)
-                                            3, // derivative gain (kD)
-                                            3, // anti windup
-                                            1, // small error range, in inches
-                                            100, // small error range timeout, in milliseconds
-                                            3, // large error range, in inches
-                                            500, // large error range timeout, in milliseconds
-                                            20 // maximum acceleration (slew)
-);
-
-// angular motion controller
-lemlib::ControllerSettings angularController(2, // proportional gain (kP)
-                                             0, // integral gain (kI)
-                                             10, // derivative gain (kD)
-                                             3, // anti windup
-                                             1, // small error range, in degrees
-                                             100, // small error range timeout, in milliseconds
-                                             3, // large error range, in degrees
-                                             500, // large error range timeout, in milliseconds
-                                             0 // maximum acceleration (slew)
-);
-
-// sensors for odometry
-lemlib::OdomSensors sensors(nullptr, // vertical tracking wheel
-                            nullptr, // vertical tracking wheel 2, set to nullptr as we don't have a second one
-                            nullptr, // horizontal tracking wheel
-                            nullptr, // horizontal tracking wheel 2, set to nullptr as we don't have a second one
-                            &imu // inertial sensor
-);
-
-// input curve for throttle input during driver control
-lemlib::ExpoDriveCurve throttleCurve(3, // joystick deadband out of 127
-                                     10, // minimum output where drivetrain will move out of 127
-                                     1 // expo curve gain
-);
-
-// input curve for steer input during driver control
-lemlib::ExpoDriveCurve steerCurve(3, // joystick deadband out of 127
-                                  10, // minimum output where drivetrain will move out of 127
-                                  1 // expo curve gain
-);
-
-// create the chassis
-lemlib::Chassis chassis(drivetrain, linearController, angularController, sensors, &throttleCurve, &steerCurve);
-
-/**
- * Runs initialization code. This occurs as soon as the program is started.
- *
- * All other competition modes are blocked by initialize; it is recommended
- * to keep execution time for this mode under a few seconds.
- */
-
-int prevLeftPower  = 0;
+// ----- GLOBALS ----- //
+int prevLeftPower = 0;
 int prevRightPower = 0;
+double targetHeading = 0;
+double lastHeadingError = 0;
+bool headingAssistActive = false;
 
-const int SLEW_STEP = 8;
-
-void initialize() {
-    pros::lcd::initialize();
-
-    leftMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_COAST);
-    rightMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_COAST);
-
-    lemlib::Pose poseA(53,-8,247);
-    chassis.calibrate();
-    while (imu.is_calibrating()) pros::delay(20);
-    chassis.setPose(poseA);
-
-    pros::Task screenTask([&]() {
-        while (true) {
-            pros::lcd::print(0, "X: %f", chassis.getPose().x);
-            pros::lcd::print(1, "Y: %f", chassis.getPose().y);
-            pros::lcd::print(2, "Theta: %f", chassis.getPose().theta);
-            pros::delay(50);
-        }
-    });
+// ----- HELPERS ----- //
+int applyDeadzone(int val) {
+    return (abs(val) > DEADZONE) ? val : 0;
 }
-
-/**
- * Runs while the robot is disabled
- */
-void disabled() {}
-
-/**
- * runs after initialize if the robot is connected to field control
- */
-void competition_initialize() {}
-
-// get a path used for pure pursuit
-// this needs to be put outside a function
-ASSET(example_txt); // '.' replaced with "_" to make c++ happy
-
-/**
- * Runs during auto
- *
- * This is an example autonomous routine which demonstrates a lot of the features LemLib has to offer
- */
-
-void spinIntake() {
-    intakeMotor.move(-127);
-    outTakeMotor.move(127);
-}
-
-void stopIntake() {
-    intakeMotor.move(0);
-    outTakeMotor.move(0);
-}
-
-void autonomous() {
-    // Move to x: 20 and y: 15, and face heading 90. Timeout set to 4000 ms
-    lemlib::Pose poseA(48.5,-10.2,246);
-    switchPiston.set_value(true);
-    chassis.setPose(poseA);
-
-    chassis.turnToPoint(13, -25, 1000);
-    spinIntake();
-    chassis.moveToPoint(13,-25, 3000, {.maxSpeed = 70});
-    pros::delay(1500);
-    stopIntake();
-    
-    chassis.turnToPoint(30, -48.5, 1000);
-    chassis.moveToPoint(30, -48.5, 1000);
-    
-    chassis.turnToPoint(55, -54, 2000);
-    chassis.moveToPoint(55, -54, 2000);
-
-    chassis.moveToPoint(19.3, -54, 2000, {.forwards = false, .earlyExitRange = 1});
-    
-    pros::lcd::print(4, "Traveled 10 inches during pure pursuit!");
-    // wait until the movement is done
-    pros::lcd::print(4, "pure pursuit finished!");
-    
-}
-
 
 int slew(int target, int current) {
-    if (target > current + SLEW_STEP)
-        return current + SLEW_STEP;
-    if (target < current - SLEW_STEP)
-        return current - SLEW_STEP;
-    return target;
+    if (target > current) {
+        current += SLEW_STEP;
+        if (current > target) current = target;
+    } else if (target < current) {
+        current -= SLEW_STEP;
+        if (current < target) current = target;
+    }
+    return current;
 }
 
-
-
+// ----- OPCONTROL ----- //
 void opcontrol() {
 
-   chassis.cancelAllMotions();
-
-    prevLeftPower = 0;
-    prevRightPower = 0;
-    headingAssistActive = false;
+    // initialize heading
+    targetHeading = imu.get_heading();
 
     while (true) {
 
-        int leftY  = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
-        int rightX = controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
+        // --- DRIVER INPUT ---
+        int forward = applyDeadzone(controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y));
+        int turn    = applyDeadzone(controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X));
 
-      
-        if (abs(leftY) < 5) leftY = 0;
-        if (abs(rightX) < 5) rightX = 0;
+        double headingError = 0;
+        double turnCorrection = 0;
 
-        static int lastLeftY = 0;
+        // --- HEADING ASSIST ---
+        if (abs(turn) < DEADZONE && abs(forward) > DEADZONE) {
+            headingAssistActive = true;
 
-        if ((lastLeftY == 0 && leftY != 0) ||
-        (lastLeftY != 0 && leftY == 0)) {
-        headingAssistActive = false;
-        lastHeadingError = 0;
-}
+            headingError = targetHeading - imu.get_heading();
+            while (headingError > 180) headingError -= 360;
+            while (headingError < -180) headingError += 360;
 
-lastLeftY = leftY;
+            double derivative = headingError - lastHeadingError;
+            turnCorrection = headingError * HEADING_KP + derivative * HEADING_KD;
+            lastHeadingError = headingError;
 
-        if (controller.get_digital(DIGITAL_R2)) {
-            intakeMotor.move(-127);
-            outTakeMotor.move(127);
-        } else if (controller.get_digital(DIGITAL_R1)) {
-            intakeMotor.move(-127);
-            outTakeMotor.move(0);
-        } else if (controller.get_digital(DIGITAL_L2)) {
-            intakeMotor.move(127);
-            outTakeMotor.move(0);
-        } else {
-            intakeMotor.move(0);
-            outTakeMotor.move(0);
+        } else if (abs(turn) > DEADZONE) {
+            headingAssistActive = false;
+            targetHeading = imu.get_heading(); // reset target when manually turning
         }
 
-    
-        if (controller.get_digital_new_press(DIGITAL_B)) {
-            matchLoaderState = !matchLoaderState;
-            matchLoader.set_value(matchLoaderState);
-        }
+        // --- MOTOR OUTPUT ---
+        int leftPower  = forward + turnCorrection + turn;
+        int rightPower = forward - turnCorrection - turn;
 
-        if (controller.get_digital_new_press(DIGITAL_X)) {
-            descoreState = !descoreState;
-            descore.set_value(descoreState);
-        }
+        // apply drift compensation
+        rightPower = rightPower * DRIFT_COMP;
 
-        if (controller.get_digital_new_press(DIGITAL_A)) {
-            switchPistonState = !switchPistonState;
-            switchPiston.set_value(switchPistonState);
-        }
+        // slew rate
+        prevLeftPower  = slew(leftPower, prevLeftPower);
+        prevRightPower = slew(rightPower, prevRightPower);
 
-      int drivePower = leftY;
-double turnPower = 0;
+        // set motors
+        leftMotors.move(prevLeftPower);
+        rightMotors.move(prevRightPower);
 
-// --- HEADING ASSIST LOGIC ---
-if (abs(rightX) < 5 && abs(leftY) > 15 && abs(drivePower) > 30) {   
-    if (!headingAssistActive) {
-        targetHeading = imu.get_heading();
-        headingAssistActive = true;
-        lastHeadingError = 0;
-    }
+        // --- SUBSYSTEMS ---
+        intakeMotor.move(controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1) ? -127 :
+                         controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2) ? 127 : 0);
 
-    double headingError = targetHeading - imu.get_heading();
+        outTakeMotor.move(controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1) ? 127 :
+                          controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2) ? -127 : 0);
 
-    // wrap error to [-180, 180]
-    if (headingError > 180) headingError -= 360;
-    if (headingError < -180) headingError += 360;
+        switchPiston.set_value(controller.get_digital(pros::E_CONTROLLER_DIGITAL_X));
+        matchLoader.set_value(controller.get_digital(pros::E_CONTROLLER_DIGITAL_Y));
+        descore.set_value(controller.get_digital(pros::E_CONTROLLER_DIGITAL_A));
 
-    // PD correction
-    double derivative = headingError - lastHeadingError;
-    turnPower = headingError * HEADING_KP + derivative * HEADING_KD;
-
-    lastHeadingError = headingError;
-
-} else {
-    // driver is turning → disable assist
-    headingAssistActive = false;
-    lastHeadingError = 0;
-
-    // normal turning curve
-    turnPower = rightX * abs(rightX) / 127.0 * 0.6;
-}
-
-// clamp turnPower
-if (turnPower > 127) turnPower = 127;
-if (turnPower < -127) turnPower = -127;
-
-int leftPower  = drivePower + turnPower;
-int rightPower = drivePower - turnPower;
-
-// Slew rate limiter
-prevLeftPower  = slew(leftPower, prevLeftPower);
-prevRightPower = slew(rightPower, prevRightPower);
-
-leftMotors.move(prevLeftPower);
-rightMotors.move(prevRightPower);
-
-pros::delay(10);
+        pros::delay(20);
     }
 }
