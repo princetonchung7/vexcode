@@ -119,6 +119,7 @@ void initialize() {
 
     lemlib::Pose poseA(53,-8,247);
     chassis.calibrate();
+    while (imu.is_calibrating()) pros::delay(20);
     chassis.setPose(poseA);
 
     pros::Task screenTask([&]() {
@@ -284,4 +285,17 @@ if (abs(rightX) < 5 && abs(leftY) > 15) {
 
     // normal turning curve
     turnPower = rightX * abs(rightX) / 127.0 * 0.6;
+        int leftPower  = drivePower + turnPower;
+        int rightPower = drivePower - turnPower;
+
+        // Slew rate limiter
+        prevLeftPower  = slew(leftPower,  prevLeftPower);
+        prevRightPower = slew(rightPower, prevRightPower);
+
+        leftMotors.move(prevLeftPower);
+        rightMotors.move(prevRightPower);
+
+        pros::delay(10);
+    }
+}
 }
