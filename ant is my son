@@ -1,29 +1,30 @@
 #include "main.h"
 
+// ----- CONTROLLER ----- //
 pros::Controller controller(pros::E_CONTROLLER_MASTER);
 
 // ----- DRIVETRAIN ----- //
-pros::MotorGroup leftMotors({-12, -13, -14}, pros::MotorGearset::blue);
-pros::MotorGroup rightMotors({1, 2, 3}, pros::MotorGearset::blue, true); // reversed
+// NOTE: I removed negative numbers from ports to make this clearer.
+// If the robot drives backward when you press forward, flip the 'false' and 'true' values.
+pros::MotorGroup leftMotors({12, 13, 14}, pros::MotorGearset::blue); 
+pros::MotorGroup rightMotors({1, 2, 3}, pros::MotorGearset::blue); 
 
 pros::Imu imu(10);
 
 // ----- SUBSYSTEMS ----- //
 pros::Motor intakeMotor(20);
 pros::Motor outTakeMotor(9);
+
+// Pneumatics
 pros::adi::DigitalOut switchPiston('B');
 pros::adi::DigitalOut matchLoader('A');
-pros::adi::DigitalOut descore('E');
+pros::adi::DigitalOut descore('E'); // Often used as the Goal Clamp
 
 // ----- SETTINGS ----- //
 const int DEADZONE = 10;
-const int MAX_SPEED = 127;
-const int SLEW_STEP = 6;    // smooth acceleration
+const int SLEW_STEP = 10; // Increased slightly for snappier direction changes
 const double HEADING_KP = 0.5;
 const double HEADING_KD = 0.1;
-
-// optional multiplier if one side is slightly stronger
-const double DRIFT_COMP = 0.96;
 
 // ----- GLOBALS ----- //
 int prevLeftPower = 0;
@@ -31,6 +32,10 @@ int prevRightPower = 0;
 double targetHeading = 0;
 double lastHeadingError = 0;
 bool headingAssistActive = false;
+
+// Toggles for Pneumatics
+bool descoreState = false;
+bool switchState = false;
 
 // ----- HELPERS ----- //
 int applyDeadzone(int val) {
@@ -48,10 +53,37 @@ int slew(int target, int current) {
     return current;
 }
 
+// ----- INITIALIZATION ----- //
+void initialize() {
+    // 1. Calibrate Inertial Sensor
+    // The robot MUST be still for 2 seconds here or the code will break.
+    pros::lcd::initialize();
+    pros::lcd::set_text(1, "Calibrating IMU...");
+    imu.reset();
+    while (imu.is_calibrating()) {
+        pros::delay(20);
+    }
+    pros::lcd::set_text(1, "IMU Ready!");
+
+    // 2. Set Brake Modes for Pushback
+    // 'HOLD' makes the motor resist movement when power is 0.
+    leftMotors.set_brake_modes(pros::E_MOTOR_BRAKE_HOLD);
+    rightMotors.set_brake_modes(pros::E_MOTOR_BRAKE_HOLD);
+    
+    // Set subsystem brake modes
+    intakeMotor.set_brake_mode(pros::E_MOTOR_BRAKE_COAST);
+    outTakeMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    
+    // 3. Set Motor Directions
+    // Reverse one side so positive power moves both forward
+    // You may need to swap which one is reversed depending on your build
+    leftMotors.set_reversed(false);
+    rightMotors.set_reversed(true); 
+}
+
 // ----- OPCONTROL ----- //
 void opcontrol() {
-
-    // initialize heading
+    
     targetHeading = imu.get_heading();
 
     while (true) {
@@ -63,11 +95,19 @@ void opcontrol() {
         double headingError = 0;
         double turnCorrection = 0;
 
-        // --- HEADING ASSIST ---
+        // --- HEADING ASSIST (PID) ---
+        // Only activate if we are driving straight and NOT turning manually
         if (abs(turn) < DEADZONE && abs(forward) > DEADZONE) {
-            headingAssistActive = true;
+            
+            if (!headingAssistActive) {
+                // We just started driving straight, lock the heading now
+                targetHeading = imu.get_heading();
+                headingAssistActive = true;
+            }
 
             headingError = targetHeading - imu.get_heading();
+            
+            // Normalize error to -180 to 180
             while (headingError > 180) headingError -= 360;
             while (headingError < -180) headingError += 360;
 
@@ -75,36 +115,48 @@ void opcontrol() {
             turnCorrection = headingError * HEADING_KP + derivative * HEADING_KD;
             lastHeadingError = headingError;
 
-        } else if (abs(turn) > DEADZONE) {
+        } else {
+            // If we are turning manually or stopped
             headingAssistActive = false;
-            targetHeading = imu.get_heading(); // reset target when manually turning
         }
 
         // --- MOTOR OUTPUT ---
+        // If heading assist is active, turnCorrection keeps us straight.
+        // If not, 'turn' takes over.
         int leftPower  = forward + turnCorrection + turn;
         int rightPower = forward - turnCorrection - turn;
 
-        // apply drift compensation
-        rightPower = rightPower * DRIFT_COMP;
-
-        // slew rate
+        // Slew rate (smooths out jerky stick movements)
         prevLeftPower  = slew(leftPower, prevLeftPower);
         prevRightPower = slew(rightPower, prevRightPower);
 
-        // set motors
         leftMotors.move(prevLeftPower);
         rightMotors.move(prevRightPower);
 
         // --- SUBSYSTEMS ---
+        
+        // Intake (R1 / R2) - Hold to run
         intakeMotor.move(controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1) ? -127 :
                          controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2) ? 127 : 0);
 
+        // Outtake (L1 / L2) - Hold to run
         outTakeMotor.move(controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1) ? 127 :
                           controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2) ? -127 : 0);
 
-        switchPiston.set_value(controller.get_digital(pros::E_CONTROLLER_DIGITAL_X));
+        // Match Loader (Y) - Hold to activate (usually safer for match loads)
         matchLoader.set_value(controller.get_digital(pros::E_CONTROLLER_DIGITAL_Y));
-        descore.set_value(controller.get_digital(pros::E_CONTROLLER_DIGITAL_A));
+
+        // Switch Piston (X) - Toggle (Press once to flip state)
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_X)) {
+            switchState = !switchState; 
+            switchPiston.set_value(switchState);
+        }
+
+        // Descore / Goal Clamp (A) - Toggle (Press once to flip state)
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_A)) {
+            descoreState = !descoreState; 
+            descore.set_value(descoreState);
+        }
 
         pros::delay(20);
     }
