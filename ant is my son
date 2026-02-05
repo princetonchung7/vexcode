@@ -264,6 +264,7 @@ if (abs(rightX) < 5 && abs(leftY) > 15) {
     if (!headingAssistActive) {
         targetHeading = imu.get_heading();
         headingAssistActive = true;
+        lastHeadingError = 0;
     }
 
     double headingError = targetHeading - imu.get_heading();
@@ -285,17 +286,22 @@ if (abs(rightX) < 5 && abs(leftY) > 15) {
 
     // normal turning curve
     turnPower = rightX * abs(rightX) / 127.0 * 0.6;
-        int leftPower  = drivePower + turnPower;
-        int rightPower = drivePower - turnPower;
-
-        // Slew rate limiter
-        prevLeftPower  = slew(leftPower,  prevLeftPower);
-        prevRightPower = slew(rightPower, prevRightPower);
-
-        leftMotors.move(prevLeftPower);
-        rightMotors.move(prevRightPower);
-
-        pros::delay(10);
-    }
 }
+
+// clamp turnPower
+if (turnPower > 127) turnPower = 127;
+if (turnPower < -127) turnPower = -127;
+
+int leftPower  = drivePower + turnPower;
+int rightPower = drivePower - turnPower;
+
+// Slew rate limiter
+prevLeftPower  = slew(leftPower, prevLeftPower);
+prevRightPower = slew(rightPower, prevRightPower);
+
+leftMotors.move(prevLeftPower);
+rightMotors.move(prevRightPower);
+
+pros::delay(10);
+    }
 }
