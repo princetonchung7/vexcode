@@ -10,7 +10,7 @@ double lastHeadingError = 0;
 const double HEADING_KP = 1.2;
 
 // derivative gain
-const double HEADING_KD = 4.5;
+const double HEADING_KD = 1.5;
 
 // controller
 pros::Controller controller(pros::E_CONTROLLER_MASTER);
@@ -260,7 +260,7 @@ lastLeftY = leftY;
 double turnPower = 0;
 
 // --- HEADING ASSIST LOGIC ---
-if (abs(rightX) < 5 && abs(leftY) > 15) {   
+if (abs(rightX) < 5 && abs(leftY) > 15 && abs(drivePower) > 30) {   
     if (!headingAssistActive) {
         targetHeading = imu.get_heading();
         headingAssistActive = true;
