@@ -4,7 +4,7 @@
 // ----- HARDWARE ----- //
 pros::Controller controller(pros::E_CONTROLLER_MASTER);
 
-pros::MotorGroup leftMotors({11, 12, 13}, pros::MotorGearset::blue);
+pros::MotorGroup leftMotors({-11, -12, -13}, pros::MotorGearset::blue);
 pros::MotorGroup rightMotors({1, 2, 3}, pros::MotorGearset::blue);
 
 pros::Imu imu(10);
