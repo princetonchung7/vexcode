@@ -1,163 +1,242 @@
 #include "main.h"
+#include <cmath>
 
-// ----- CONTROLLER ----- //
+// ----- HARDWARE ----- //
 pros::Controller controller(pros::E_CONTROLLER_MASTER);
 
-// ----- DRIVETRAIN ----- //
-// NOTE: I removed negative numbers from ports to make this clearer.
-// If the robot drives backward when you press forward, flip the 'false' and 'true' values.
-pros::MotorGroup leftMotors({12, 13, 14}, pros::MotorGearset::blue); 
-pros::MotorGroup rightMotors({1, 2, 3}, pros::MotorGearset::blue); 
+pros::MotorGroup leftMotors({11, 12, 13}, pros::MotorGearset::blue);
+pros::MotorGroup rightMotors({1, 2, 3}, pros::MotorGearset::blue);
 
 pros::Imu imu(10);
 
-// ----- SUBSYSTEMS ----- //
 pros::Motor intakeMotor(20);
 pros::Motor outTakeMotor(9);
 
-// Pneumatics
 pros::adi::DigitalOut switchPiston('B');
 pros::adi::DigitalOut matchLoader('A');
-pros::adi::DigitalOut descore('E'); // Often used as the Goal Clamp
+pros::adi::DigitalOut descore('E');
 
-// ----- SETTINGS ----- //
-const int DEADZONE = 10;
-const int SLEW_STEP = 10; // Increased slightly for snappier direction changes
-const double HEADING_KP = 0.5;
-const double HEADING_KD = 0.1;
+// ----- TUNING PARAMETERS ----- //
+// MOTOR CALIBRATION - Only adjust if one side is consistently weaker
+const double LEFT_SIDE_MULTIPLIER = 1.0;    // Set to 1.0 since it's working now
+const double RIGHT_SIDE_MULTIPLIER = 1.0;   // Keep at 1.0
 
-// ----- GLOBALS ----- //
+// Deadzones
+const int JOYSTICK_DEADZONE = 10;
+const int TURN_DEADZONE = 15;
+
+// Minimum power to overcome friction
+const int MIN_DRIVE_POWER = 12;  // Increased to help overcome the initial friction difference
+
+// Slew rate
+const int ACCEL_STEP = 7;    // Slightly slower to give both sides time to sync
+const int DECEL_STEP = 15;   // Faster decel to prevent drift when stopping
+const int SNAP_TO_ZERO_THRESHOLD = 8;  // Snap to 0 if target is 0 and we're close
+
+// Heading correction
+const double HEADING_KP = 0.6;
+const double HEADING_KD = 0.15;
+const double MAX_CORRECTION = 30.0;
+
+// ----- STATE VARIABLES ----- //
 int prevLeftPower = 0;
 int prevRightPower = 0;
-double targetHeading = 0;
-double lastHeadingError = 0;
-bool headingAssistActive = false;
 
-// Toggles for Pneumatics
+double referenceHeading = 0;
+double lastHeadingError = 0;
+bool headingLocked = false;
+
 bool descoreState = false;
 bool switchState = false;
 
-// ----- HELPERS ----- //
-int applyDeadzone(int val) {
-    return (abs(val) > DEADZONE) ? val : 0;
+uint32_t lastDebugTime = 0;
+
+// ----- HELPER FUNCTIONS ----- //
+
+int applyDeadzone(int value, int deadzone) {
+    return (std::abs(value) > deadzone) ? value : 0;
 }
 
-int slew(int target, int current) {
-    if (target > current) {
-        current += SLEW_STEP;
-        if (current > target) current = target;
-    } else if (target < current) {
-        current -= SLEW_STEP;
-        if (current < target) current = target;
+int applyMinPower(int value, int minPower) {
+    if (value == 0) return 0;
+    if (value > 0) return value + minPower;
+    return value - minPower;
+}
+
+// Apply motor calibration to compensate for mechanical differences
+int calibrateMotor(int power, double multiplier) {
+    if (power == 0) return 0;
+    int calibrated = (int)std::round(power * multiplier);
+    return std::clamp(calibrated, -127, 127);
+}
+
+void applySlewRate(int leftTarget, int rightTarget, int &prevLeft, int &prevRight) {
+    
+    // SNAP TO ZERO - if target is 0 and we're close, just stop immediately
+    // This prevents drift during the final moments of deceleration
+    if (leftTarget == 0 && std::abs(prevLeft) <= SNAP_TO_ZERO_THRESHOLD) {
+        prevLeft = 0;
     }
-    return current;
+    if (rightTarget == 0 && std::abs(prevRight) <= SNAP_TO_ZERO_THRESHOLD) {
+        prevRight = 0;
+    }
+    
+    // If both snapped to zero, we're done
+    if (prevLeft == 0 && prevRight == 0) {
+        return;
+    }
+    
+    int leftDelta = leftTarget - prevLeft;
+    int rightDelta = rightTarget - prevRight;
+    
+    bool accelerating = (std::abs(leftTarget) > std::abs(prevLeft)) || 
+                       (std::abs(rightTarget) > std::abs(prevRight));
+    
+    int maxStep = accelerating ? ACCEL_STEP : DECEL_STEP;
+    
+    int maxDelta = std::max(std::abs(leftDelta), std::abs(rightDelta));
+    
+    if (maxDelta > maxStep) {
+        double scale = (double)maxStep / (double)maxDelta;
+        leftDelta = (int)std::round(leftDelta * scale);
+        rightDelta = (int)std::round(rightDelta * scale);
+    }
+    
+    prevLeft += leftDelta;
+    prevRight += rightDelta;
+    
+    prevLeft = std::clamp(prevLeft, -127, 127);
+    prevRight = std::clamp(prevRight, -127, 127);
 }
 
 // ----- INITIALIZATION ----- //
 void initialize() {
-    // 1. Calibrate Inertial Sensor
-    // The robot MUST be still for 2 seconds here or the code will break.
     pros::lcd::initialize();
     pros::lcd::set_text(1, "Calibrating IMU...");
+    
     imu.reset();
     while (imu.is_calibrating()) {
         pros::delay(20);
     }
-    pros::lcd::set_text(1, "IMU Ready!");
-
-    // 2. Set Brake Modes for Pushback
-    // 'HOLD' makes the motor resist movement when power is 0.
-    leftMotors.set_brake_modes(pros::E_MOTOR_BRAKE_HOLD);
-    rightMotors.set_brake_modes(pros::E_MOTOR_BRAKE_HOLD);
     
-    // Set subsystem brake modes
+    pros::lcd::set_text(1, "IMU Ready!");
+    
+    leftMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_HOLD);
+    rightMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_HOLD);
     intakeMotor.set_brake_mode(pros::E_MOTOR_BRAKE_COAST);
     outTakeMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
-    
-    // 3. Set Motor Directions
-    // Reverse one side so positive power moves both forward
-    // You may need to swap which one is reversed depending on your build
-    leftMotors.set_reversed(false);
-    rightMotors.set_reversed(true); 
 }
 
-// ----- OPCONTROL ----- //
+void disabled() {}
+void competition_initialize() {}
+void autonomous() {}
+
+// ----- DRIVER CONTROL ----- //
 void opcontrol() {
     
-    targetHeading = imu.get_heading();
-
+    prevLeftPower = 0;
+    prevRightPower = 0;
+    headingLocked = false;
+    lastHeadingError = 0;
+    
+    referenceHeading = imu.get_heading();
+    
     while (true) {
-
-        // --- DRIVER INPUT ---
-        int forward = applyDeadzone(controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y));
-        int turn    = applyDeadzone(controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X));
-
-        double headingError = 0;
-        double turnCorrection = 0;
-
-        // --- HEADING ASSIST (PID) ---
-        // Only activate if we are driving straight and NOT turning manually
-        if (abs(turn) < DEADZONE && abs(forward) > DEADZONE) {
-            
-            if (!headingAssistActive) {
-                // We just started driving straight, lock the heading now
-                targetHeading = imu.get_heading();
-                headingAssistActive = true;
-            }
-
-            headingError = targetHeading - imu.get_heading();
-            
-            // Normalize error to -180 to 180
-            while (headingError > 180) headingError -= 360;
-            while (headingError < -180) headingError += 360;
-
-            double derivative = headingError - lastHeadingError;
-            turnCorrection = headingError * HEADING_KP + derivative * HEADING_KD;
-            lastHeadingError = headingError;
-
-        } else {
-            // If we are turning manually or stopped
-            headingAssistActive = false;
-        }
-
-        // --- MOTOR OUTPUT ---
-        // If heading assist is active, turnCorrection keeps us straight.
-        // If not, 'turn' takes over.
-        int leftPower  = forward + turnCorrection + turn;
-        int rightPower = forward - turnCorrection - turn;
-
-        // Slew rate (smooths out jerky stick movements)
-        prevLeftPower  = slew(leftPower, prevLeftPower);
-        prevRightPower = slew(rightPower, prevRightPower);
-
-        leftMotors.move(prevLeftPower);
-        rightMotors.move(prevRightPower);
-
-        // --- SUBSYSTEMS ---
         
-        // Intake (R1 / R2) - Hold to run
-        intakeMotor.move(controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1) ? -127 :
-                         controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2) ? 127 : 0);
-
-        // Outtake (L1 / L2) - Hold to run
-        outTakeMotor.move(controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1) ? 127 :
-                          controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2) ? -127 : 0);
-
-        // Match Loader (Y) - Hold to activate (usually safer for match loads)
+        // ----- READ CONTROLLER INPUT ----- //
+        int rawForward = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
+        int rawTurn = controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
+        
+        int forward = applyDeadzone(rawForward, JOYSTICK_DEADZONE);
+        int turn = applyDeadzone(rawTurn, TURN_DEADZONE);
+        
+        forward = applyMinPower(forward, MIN_DRIVE_POWER);
+        
+        // ----- HEADING CORRECTION ----- //
+        double correction = 0;
+        
+        if (turn == 0 && forward != 0) {
+            
+            if (!headingLocked) {
+                referenceHeading = imu.get_heading();
+                headingLocked = true;
+                lastHeadingError = 0;
+            }
+            
+            double currentHeading = imu.get_heading();
+            double error = referenceHeading - currentHeading;
+            
+            while (error > 180) error -= 360;
+            while (error < -180) error += 360;
+            
+            double derivative = error - lastHeadingError;
+            correction = (error * HEADING_KP) + (derivative * HEADING_KD);
+            correction = std::clamp(correction, -MAX_CORRECTION, MAX_CORRECTION);
+            
+            lastHeadingError = error;
+            
+        } else {
+            headingLocked = false;
+            lastHeadingError = 0;
+        }
+        
+        // ----- CALCULATE MOTOR POWERS ----- //
+        int leftPower = (int)(forward + turn + correction);
+        int rightPower = (int)(forward - turn - correction);
+        
+        // Apply slew rate limiting
+        applySlewRate(leftPower, rightPower, prevLeftPower, prevRightPower);
+        
+        // **MOTOR CALIBRATION** - Compensate for mechanical differences
+        int calibratedLeft = calibrateMotor(prevLeftPower, LEFT_SIDE_MULTIPLIER);
+        int calibratedRight = calibrateMotor(prevRightPower, RIGHT_SIDE_MULTIPLIER);
+        
+        // Send to motors
+        leftMotors.move(calibratedLeft);
+        rightMotors.move(calibratedRight);
+        
+        // ----- SUBSYSTEMS ----- //
+        
+        intakeMotor.move(
+            controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1) ? -127 :
+            controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2) ? 127 : 0
+        );
+        
+        outTakeMotor.move(
+            controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1) ? 127 :
+            controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2) ? -127 : 0
+        );
+        
         matchLoader.set_value(controller.get_digital(pros::E_CONTROLLER_DIGITAL_Y));
-
-        // Switch Piston (X) - Toggle (Press once to flip state)
+        
         if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_X)) {
-            switchState = !switchState; 
+            switchState = !switchState;
             switchPiston.set_value(switchState);
         }
-
-        // Descore / Goal Clamp (A) - Toggle (Press once to flip state)
+        
         if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_A)) {
-            descoreState = !descoreState; 
+            descoreState = !descoreState;
             descore.set_value(descoreState);
         }
-
+        
+        // Manual heading reset
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_DOWN)) {
+            referenceHeading = imu.get_heading();
+            controller.rumble(".");
+        }
+        
+        // ----- DEBUG OUTPUT ----- //
+        uint32_t now = pros::millis();
+        if (now - lastDebugTime > 150) {
+            lastDebugTime = now;
+            
+            pros::lcd::print(3, "Raw: F=%4d T=%4d", rawForward, rawTurn);
+            pros::lcd::print(4, "Pwr: L=%4d(%4d) R=%4d(%4d)", 
+                           prevLeftPower, calibratedLeft, prevRightPower, calibratedRight);
+            pros::lcd::print(5, "Hdg: %.1f | Ref: %.1f | Corr: %.1f", 
+                           imu.get_heading(), referenceHeading, correction);
+        }
+        
         pros::delay(20);
     }
 }
