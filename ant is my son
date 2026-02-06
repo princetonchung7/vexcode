@@ -17,9 +17,9 @@ pros::adi::DigitalOut matchLoader('A');
 pros::adi::DigitalOut descore('E');
 
 // ----- TUNING PARAMETERS ----- //
-// MOTOR CALIBRATION - Only adjust if one side is consistently weaker
-const double LEFT_SIDE_MULTIPLIER = 1.0;    // Set to 1.0 since it's working now
-const double RIGHT_SIDE_MULTIPLIER = 1.0;   // Keep at 1.0
+// MOTOR CALIBRATION - Adjust these to balance left/right sides
+const double LEFT_SIDE_MULTIPLIER = 1.0;   // Increase this if left is slower (try 1.05-1.15)
+const double RIGHT_SIDE_MULTIPLIER = 1.0;   // Keep this at 1.0, adjust left instead
 
 // Deadzones
 const int JOYSTICK_DEADZONE = 10;
@@ -30,8 +30,7 @@ const int MIN_DRIVE_POWER = 12;  // Increased to help overcome the initial frict
 
 // Slew rate
 const int ACCEL_STEP = 7;    // Slightly slower to give both sides time to sync
-const int DECEL_STEP = 15;   // Faster decel to prevent drift when stopping
-const int SNAP_TO_ZERO_THRESHOLD = 8;  // Snap to 0 if target is 0 and we're close
+const int DECEL_STEP = 10;
 
 // Heading correction
 const double HEADING_KP = 0.6;
@@ -71,20 +70,6 @@ int calibrateMotor(int power, double multiplier) {
 }
 
 void applySlewRate(int leftTarget, int rightTarget, int &prevLeft, int &prevRight) {
-    
-    // SNAP TO ZERO - if target is 0 and we're close, just stop immediately
-    // This prevents drift during the final moments of deceleration
-    if (leftTarget == 0 && std::abs(prevLeft) <= SNAP_TO_ZERO_THRESHOLD) {
-        prevLeft = 0;
-    }
-    if (rightTarget == 0 && std::abs(prevRight) <= SNAP_TO_ZERO_THRESHOLD) {
-        prevRight = 0;
-    }
-    
-    // If both snapped to zero, we're done
-    if (prevLeft == 0 && prevRight == 0) {
-        return;
-    }
     
     int leftDelta = leftTarget - prevLeft;
     int rightDelta = rightTarget - prevRight;
