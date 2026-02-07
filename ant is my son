@@ -101,14 +101,14 @@ void applySlewRate(int leftTarget, int rightTarget, int &prevLeft, int &prevRigh
 // ----- INITIALIZATION ----- //
 void initialize() {
     pros::lcd::initialize();
-    pros::lcd::set_text(1, "putting korey in my sex chambe....");
+    pros::lcd::set_text(1, "throwing ant and korey in my private dungeon....");
     
     imu.reset();
     while (imu.is_calibrating()) {
         pros::delay(20);
     }
     
-    pros::lcd::set_text(1, "Korey butthole expanded!!! RAPE NIGGERS");
+    pros::lcd::set_text(1, "oiled up and ready to have fun with!");
     
     leftMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_HOLD);
     rightMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_HOLD);
@@ -193,9 +193,14 @@ void opcontrol() {
         // R2: Conveyer and outtake
         // ----- CONVEYOR / OUTTAKE CONTROL -----
 if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1)) {
-    // Reverse conveyor
+    // conveyer reverse only
     intakeMotor.move(127);   // reversed
     outTakeMotor.move(0);
+} 
+else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2)) {
+    // outtake reverse only
+    intakeMotor.move(0);
+    outTakeMotor.move(127);
 } 
 else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1)) {
     // Conveyor forward only
@@ -213,17 +218,17 @@ else {
     outTakeMotor.move(0);
 }
 
-        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_Y)) {
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)) {
         matchLoaderState = !matchLoaderState;
         matchLoader.set_value(matchLoaderState);
         }
         
-        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_X)) {
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_A)) {
             switchState = !switchState;
             switchPiston.set_value(switchState);
         }
         
-        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_A)) {
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_X)) {
             descoreState = !descoreState;
             descore.set_value(descoreState);
         }
