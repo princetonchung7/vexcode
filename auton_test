@@ -1,0 +1,584 @@
+// main.cpp
+#include "main.h"
+#include <cmath>
+#include <algorithm>
+
+constexpr double PI = 3.14159265358979323846;
+
+// ----- HARDWARE ----- //
+pros::Controller controller(pros::E_CONTROLLER_MASTER);
+
+pros::MotorGroup leftMotors({-11, -12, -13}, pros::MotorGearset::blue);
+pros::MotorGroup rightMotors({1, 2, 3}, pros::MotorGearset::blue);
+
+pros::Imu imu(10);
+
+pros::Motor intakeMotor(20);
+pros::Motor outTakeMotor(9);
+
+pros::adi::DigitalOut switchPiston('B');
+pros::adi::DigitalOut matchLoader('A');
+pros::adi::DigitalOut descore('E');
+
+// Use leader motor ports as encoder references
+pros::Motor leftEncoder(-11);
+pros::Motor rightEncoder(1);
+
+// ----- TUNING PARAMETERS ----- //
+const double LEFT_SIDE_MULTIPLIER = 1.0;
+const double RIGHT_SIDE_MULTIPLIER = 1.0;
+
+const int JOYSTICK_DEADZONE = 5;
+const int TURN_DEADZONE = 20;
+
+const double TURN_SENSITIVITY = 0.55;
+
+const int MIN_DRIVE_POWER = 12;
+
+// slew steps (OPTIMIZED: faster deceleration)
+const int ACCEL_STEP = 15;
+const int DECEL_STEP = 25;  // Was 8, now much faster
+
+const double HEADING_KP = 0.6;
+const double HEADING_KD = 0.15;
+const double MAX_CORRECTION = 30.0;
+
+// threshold to decide when to perform an in-place turn vs steering while driving
+const double IN_PLACE_TURN_THRESHOLD_DEG = 25.0;
+
+// ----- ODOMETRY / PHYSICAL CONSTANTS ----- //
+const double WHEEL_DIAM_IN = 3.25;
+const double WHEEL_CIRCUM_IN = PI * WHEEL_DIAM_IN;
+const double TRACK_WIDTH_IN = 11.5;
+
+const int LEFT_SIGN = 1;
+const int RIGHT_SIGN = 1;
+
+// ----- STATE VARIABLES ----- //
+int prevLeftPower = 0;
+int prevRightPower = 0;
+
+double referenceHeading = 0.0;
+double lastHeadingError = 0.0;
+bool headingLocked = false;
+
+bool descoreState = false;
+bool switchState = true;
+bool matchLoaderState = false;
+
+uint32_t lastDebugTime = 0;
+
+// odom state (in inches)
+double odom_x_in = 0.0;
+double odom_y_in = 0.0;
+double prev_left_deg = 0.0;
+double prev_right_deg = 0.0;
+
+// IMU heading offset
+double imu_heading_offset_deg = 0.0;
+
+// Prevent autonomous double-run
+static bool auton_ran = false;
+
+// ----- HELPER FUNCTIONS ----- //
+int applyDeadzone(int value, int deadzone) {
+    return (std::abs(value) > deadzone) ? value : 0;
+}
+
+int applyMinPower(int value, int minPower) {
+    if (value == 0) return 0;
+    if (value > 0) return value + minPower;
+    return value - minPower;
+}
+
+int calibrateMotor(int power, double multiplier) {
+    if (power == 0) return 0;
+    int calibrated = (int)std::round(power * multiplier);
+    return std::clamp(calibrated, -127, 127);
+}
+
+// Slew rate limiter: prevLeft/prevRight are updated towards leftTarget/rightTarget
+void applySlewRate(int leftTarget, int rightTarget, int &prevLeft, int &prevRight) {
+    int leftDelta = leftTarget - prevLeft;
+    int rightDelta = rightTarget - prevRight;
+
+    bool accelerating = (std::abs(leftTarget) > std::abs(prevLeft)) ||
+                       (std::abs(rightTarget) > std::abs(prevRight));
+
+    int maxStep = accelerating ? ACCEL_STEP : DECEL_STEP;
+
+    int maxDelta = std::max(std::abs(leftDelta), std::abs(rightDelta));
+
+    if (maxDelta > maxStep) {
+        double scale = (double)maxStep / (double)maxDelta;
+        leftDelta = (int)std::round(leftDelta * scale);
+        rightDelta = (int)std::round(rightDelta * scale);
+    }
+
+    prevLeft += leftDelta;
+    prevRight += rightDelta;
+
+    prevLeft = std::clamp(prevLeft, -127, 127);
+    prevRight = std::clamp(prevRight, -127, 127);
+}
+
+static double normalizeAngleDeg(double angle) {
+    while (angle >= 180.0) angle -= 360.0;
+    while (angle < -180.0) angle += 360.0;
+    return angle;
+}
+
+static double getIMUHeading() {
+    double raw = imu.get_heading(); // typically 0-360
+    double withOffset = raw + imu_heading_offset_deg;
+    return normalizeAngleDeg(withOffset);
+}
+
+// Ramp prevLeftPower/prevRightPower down to zero using applySlewRate and apply outputs.
+// Safety: maxIterations prevents infinite loops if something goes wrong.
+// OPTIMIZED: faster loop delay
+void stopDriveSmooth() {
+    const int LOOP_DELAY_MS = 10;  // Was 20ms, now 10ms for faster stops
+    const int MAX_ITERATIONS = 60; // ~600ms at 10ms per iteration with DECEL_STEP=25
+    int it = 0;
+    while ((prevLeftPower != 0 || prevRightPower != 0) && ++it <= MAX_ITERATIONS) {
+        applySlewRate(0, 0, prevLeftPower, prevRightPower);
+        int calL = calibrateMotor(prevLeftPower, LEFT_SIDE_MULTIPLIER);
+        int calR = calibrateMotor(prevRightPower, RIGHT_SIDE_MULTIPLIER);
+        leftMotors.move(calL);
+        rightMotors.move(calR);
+        pros::delay(LOOP_DELAY_MS);
+    }
+    // Force zero if still nonzero for safety
+    prevLeftPower = 0;
+    prevRightPower = 0;
+    leftMotors.move(0);
+    rightMotors.move(0);
+    pros::delay(5); // tiny settle delay
+}
+
+// ----- ODOMETRY ----- //
+void resetOdometry(double x = 0.0, double y = 0.0, double headingDeg = 0.0) {
+    odom_x_in = x;
+    odom_y_in = y;
+    prev_left_deg = leftEncoder.get_position() * LEFT_SIGN;
+    prev_right_deg = rightEncoder.get_position() * RIGHT_SIGN;
+    double actualIMU = imu.get_heading();
+    imu_heading_offset_deg = normalizeAngleDeg(headingDeg - actualIMU);
+    referenceHeading = headingDeg;
+}
+
+void updateOdometryFromEncoders() {
+    double left_deg = leftEncoder.get_position() * LEFT_SIGN;
+    double right_deg = rightEncoder.get_position() * RIGHT_SIGN;
+
+    double dleft_deg = left_deg - prev_left_deg;
+    double dright_deg = right_deg - prev_right_deg;
+
+    prev_left_deg = left_deg;
+    prev_right_deg = right_deg;
+
+    double dleft_in = (dleft_deg / 360.0) * WHEEL_CIRCUM_IN;
+    double dright_in = (dright_deg / 360.0) * WHEEL_CIRCUM_IN;
+
+    double ds = 0.5 * (dleft_in + dright_in);
+
+    double theta_deg = getIMUHeading();
+    double theta_rad = theta_deg * PI / 180.0;
+
+    odom_x_in += ds * std::cos(theta_rad);
+    odom_y_in += ds * std::sin(theta_rad);
+}
+
+// ----- DRIVE PRIMITIVES ----- //
+void setDriveMotorsRaw(int left, int right) {
+    leftMotors.move(std::clamp(left, -127, 127));
+    rightMotors.move(std::clamp(right, -127, 127));
+}
+
+void stopDrive() {
+    leftMotors.move(0);
+    rightMotors.move(0);
+}
+
+// Quick in-place turn that avoids a long stop/decel. Uses direct motor commands,
+// and resets prevLeftPower/prevRightPower to avoid long slewing after the turn.
+void quickTurnToHeading(double targetDeg, double toleranceDeg = 6.0) {
+    const double KPQ = 0.9;
+    const int MAX_TURN_Q = 80;
+    const int MIN_TURN_Q = 12;
+    uint32_t start = pros::millis();
+    const uint32_t TIMEOUT_MS = 4000;
+
+    while (true) {
+        double cur = getIMUHeading();
+        double err = normalizeAngleDeg(targetDeg - cur);
+        if (std::abs(err) <= toleranceDeg) break;
+        if (pros::millis() - start > TIMEOUT_MS) {
+            pros::lcd::print(7, "quickTurnToHeading TIMEOUT");
+            break;
+        }
+
+        double power = KPQ * err;
+        if (std::abs(power) < MIN_TURN_Q) power = (power >= 0) ? MIN_TURN_Q : -MIN_TURN_Q;
+        if (std::abs(power) > MAX_TURN_Q) power = (power > 0 ? MAX_TURN_Q : -MAX_TURN_Q);
+
+        // FIXED: Inverted signs to correct turn direction
+        int leftP = (int)(-power);
+        int rightP = (int)(power);
+
+        leftMotors.move(calibrateMotor(leftP, LEFT_SIDE_MULTIPLIER));
+        rightMotors.move(calibrateMotor(rightP, RIGHT_SIDE_MULTIPLIER));
+        pros::delay(12);
+    }
+
+    // Stop and reset prev power so slew logic after the turn behaves consistently
+    leftMotors.move(0);
+    rightMotors.move(0);
+    prevLeftPower = 0;
+    prevRightPower = 0;
+    pros::delay(8); // small settle
+}
+
+// Turn in place. Uses slew to avoid abrupt changes. Ensures starting from near-zero prev power.
+// OPTIMIZED: Optional stop at end for final turns
+void turnToHeading(double targetDeg, double toleranceDeg = 3.0, bool stopAtEnd = false) {
+    const double KP = 0.9;
+    const int MAX_TURN = 80;
+    const int MIN_TURN = 12;
+    uint32_t start = pros::millis();
+    const uint32_t TIMEOUT_MS = 8000;
+
+    // Bring drivetrain close to zero before starting the turn
+    for (int i = 0; i < 6; ++i) {
+        applySlewRate(0, 0, prevLeftPower, prevRightPower);
+        int calL = calibrateMotor(prevLeftPower, LEFT_SIDE_MULTIPLIER);
+        int calR = calibrateMotor(prevRightPower, RIGHT_SIDE_MULTIPLIER);
+        leftMotors.move(calL);
+        rightMotors.move(calR);
+        pros::delay(10);
+    }
+
+    while (true) {
+        if (pros::millis() - start > TIMEOUT_MS) {
+            pros::lcd::print(7, "turnToHeading TIMEOUT");
+            break;
+        }
+        double cur = getIMUHeading();
+        double err = normalizeAngleDeg(targetDeg - cur);
+        if (std::abs(err) <= toleranceDeg) break;
+
+        double power = KP * err;
+        if (std::abs(power) < MIN_TURN) power = (power >= 0) ? MIN_TURN : -MIN_TURN;
+        if (std::abs(power) > MAX_TURN) power = (power > 0 ? MAX_TURN : -MAX_TURN);
+        
+        // FIXED: Inverted signs to correct turn direction
+        int leftP = (int)(-power);
+        int rightP = (int)(power);
+
+        applySlewRate(leftP, rightP, prevLeftPower, prevRightPower);
+        int calL = calibrateMotor(prevLeftPower, LEFT_SIDE_MULTIPLIER);
+        int calR = calibrateMotor(prevRightPower, RIGHT_SIDE_MULTIPLIER);
+        leftMotors.move(calL);
+        rightMotors.move(calR);
+
+        updateOdometryFromEncoders();
+        pros::delay(15);
+    }
+
+    // Stop if this is a final turn
+    if (stopAtEnd) {
+        stopDriveSmooth();
+    }
+}
+
+// Drive to a world coordinate (tx, ty) within time limit. Steers while driving when heading error small,
+// otherwise performs a quick in-place turn before continuing.
+// stopAtEnd: if true, calls stopDriveSmooth() when target reached (default false for chained movements)
+bool driveToTargetWithTimeout(double tx, double ty, double timeLimitMs = 8000, double positionTolIn = 1.0, bool stopAtEnd = false) {
+    const double KP_DIST = 10.0;     // map distance to motor power
+    const double MAX_SPEED = 127.0;
+    const double MIN_SPEED = 10.0;
+    const double KP_HEADING = 0.9;
+
+    uint32_t start = pros::millis();
+
+    while (pros::millis() - start < (uint32_t)timeLimitMs) {
+        updateOdometryFromEncoders();
+        double dx = tx - odom_x_in;
+        double dy = ty - odom_y_in;
+        double dist = std::hypot(dx, dy);
+
+        if (dist <= positionTolIn) {
+            if (stopAtEnd) {
+                stopDriveSmooth();
+            }
+            return true;
+        }
+
+        double desiredRad = std::atan2(dy, dx);
+        double desiredDeg = desiredRad * 180.0 / PI;
+        double curDeg = getIMUHeading();
+        double headingErr = normalizeAngleDeg(desiredDeg - curDeg);
+
+        // If heading error is large, perform a quick alignment
+        if (std::abs(headingErr) > IN_PLACE_TURN_THRESHOLD_DEG) {
+            // Use a quicker alignment that avoids a long decel/pause
+            quickTurnToHeading(desiredDeg, 6.0);
+            // after quick turn, continue main loop to recalc dist/heading
+            continue;
+        }
+
+        // normal drive with steering correction
+        double forwardP = KP_DIST * dist;
+        if (forwardP > MAX_SPEED) forwardP = MAX_SPEED;
+        if (forwardP < MIN_SPEED) forwardP = MIN_SPEED;
+
+        double correction = KP_HEADING * headingErr;
+        double leftP_d = forwardP + correction;
+        double rightP_d = forwardP - correction;
+
+        int leftI = (int)std::clamp(leftP_d, -127.0, 127.0);
+        int rightI = (int)std::clamp(rightP_d, -127.0, 127.0);
+
+        applySlewRate(leftI, rightI, prevLeftPower, prevRightPower);
+        int calL = calibrateMotor(prevLeftPower, LEFT_SIDE_MULTIPLIER);
+        int calR = calibrateMotor(prevRightPower, RIGHT_SIDE_MULTIPLIER);
+        leftMotors.move(calL);
+        rightMotors.move(calR);
+
+        pros::delay(15);
+    }
+
+    // timeout handler
+    if (stopAtEnd) {
+        stopDriveSmooth();
+    }
+    pros::lcd::print(7, "driveToTarget TIMEOUT");
+    return false;
+}
+
+// ----- INITIALIZATION ----- //
+void initialize() {
+    pros::lcd::initialize();
+    pros::lcd::set_text(1, "Initializing...");
+
+    imu.reset();
+    while (imu.is_calibrating()) {
+        pros::delay(20);
+    }
+
+    pros::lcd::set_text(1, "Ready!");
+
+    leftMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_HOLD);
+    rightMotors.set_brake_mode_all(pros::E_MOTOR_BRAKE_HOLD);
+    intakeMotor.set_brake_mode(pros::E_MOTOR_BRAKE_COAST);
+    outTakeMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+
+    leftEncoder.tare_position();
+    rightEncoder.tare_position();
+    prev_left_deg = leftEncoder.get_position() * LEFT_SIGN;
+    prev_right_deg = rightEncoder.get_position() * RIGHT_SIGN;
+    odom_x_in = 0.0;
+    odom_y_in = 0.0;
+    referenceHeading = getIMUHeading();
+
+    pros::lcd::print(2, "IMU raw: %.2f", imu.get_heading());
+    pros::lcd::print(3, "Enc L=%.2f R=%.2f", prev_left_deg, prev_right_deg);
+
+    // Run auton immediately for testing like before if not already run
+    if (!auton_ran) {
+        pros::lcd::print(4, "AUTO: starting in 600ms");
+        pros::delay(600);
+        pros::lcd::print(5, "AUTO: CALLING autonomous()");
+        autonomous();
+        pros::lcd::print(6, "AUTO: finished, switching to manual");
+        pros::delay(150);
+    }
+}
+
+void disabled() {}
+void competition_initialize() {}
+
+// ----- AUTONOMOUS ----- //
+// OPTIMIZED: Using quickTurnToHeading for faster transitions, no stops between movements
+void autonomous() {
+    if (auton_ran) {
+        pros::lcd::print(8, "autonomous() skipped (already ran)");
+        return;
+    }
+    auton_ran = true;
+
+    pros::lcd::print(7, "AUTON STARTED");
+
+    // Keep switch piston fully extended the entire auton
+    switchState = true;
+    switchPiston.set_value(true);
+
+    // Ensure match loader fully retracted at the beginning
+    matchLoaderState = false;
+    matchLoader.set_value(false);
+
+    // 1) Starting pose and heading as specified
+    resetOdometry(16.25, -47.15, 333.6);
+    pros::lcd::print(3, "Start X=%.2f Y=%.2f H=%.2f", odom_x_in, odom_y_in, getIMUHeading());
+
+    // START INTAKE - runs until we reach point 3
+    intakeMotor.move(-127);
+    outTakeMotor.move(0);
+
+    // 2) Drive to first target
+    const double target1_x = 61.99;
+    const double target1_y = -63.29;
+    const double approachHeading1 = 343.4; // realignment heading for point 1
+
+    driveToTargetWithTimeout(target1_x, target1_y, 8000, 2.0); // No stop at end
+
+    // OPTIMIZED: Use quickTurnToHeading for faster realignment
+    quickTurnToHeading(approachHeading1, 6.0);
+
+    // 3) Drive to second target
+    const double target2_x = 35.09;   // updated X
+    const double target2_y = -94.30;  // updated Y
+
+    driveToTargetWithTimeout(target2_x, target2_y, 8000, 2.0); // No stop - continue to final point
+
+    // 4) Drive to final target
+    const double target3_x = 58.24;
+    const double target3_y = -87.49;
+    const double finalHeading = -176.1;
+
+    // Stop at final position before turning
+    driveToTargetWithTimeout(target3_x, target3_y, 8000, 2.0, true);
+    
+    // STOP INTAKE after reaching point 3
+    intakeMotor.move(0);
+    outTakeMotor.move(0);
+    
+    // Small delay to ensure complete stop
+    pros::delay(100);
+    
+    // Final orientation with proper stop at end
+    turnToHeading(finalHeading, 3.0, true);
+    
+    // Ensure motors are completely stopped
+    leftMotors.move(0);
+    rightMotors.move(0);
+    prevLeftPower = 0;
+    prevRightPower = 0;
+
+    pros::lcd::print(4, "AUTON FINISHED: X=%.2f Y=%.2f H=%.2f", odom_x_in, odom_y_in, getIMUHeading());
+    pros::delay(10);
+}
+
+// ----- DRIVER CONTROL ----- //
+void opcontrol() {
+    prevLeftPower = 0;
+    prevRightPower = 0;
+    headingLocked = false;
+    lastHeadingError = 0;
+
+    referenceHeading = getIMUHeading();
+
+    prev_left_deg = leftEncoder.get_position() * LEFT_SIGN;
+    prev_right_deg = rightEncoder.get_position() * RIGHT_SIGN;
+
+    while (true) {
+        int rawForward = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_Y);
+        int rawTurn = controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_X);
+
+        int forward = applyDeadzone(rawForward, JOYSTICK_DEADZONE);
+        int turn = applyDeadzone(rawTurn, TURN_DEADZONE);
+
+        turn = (int)(turn * TURN_SENSITIVITY);
+
+        forward = applyMinPower(forward, MIN_DRIVE_POWER);
+
+        double correction = 0;
+
+        if (turn == 0 && forward != 0) {
+            if (!headingLocked) {
+                referenceHeading = getIMUHeading();
+                headingLocked = true;
+                lastHeadingError = 0;
+            }
+
+            double currentHeading = getIMUHeading();
+            double error = referenceHeading - currentHeading;
+
+            while (error > 180) error -= 360;
+            while (error < -180) error += 360;
+
+            double derivative = error - lastHeadingError;
+            correction = (error * HEADING_KP) + (derivative * HEADING_KD);
+            correction = std::clamp(correction, -MAX_CORRECTION, MAX_CORRECTION);
+
+            lastHeadingError = error;
+        } else {
+            headingLocked = false;
+            lastHeadingError = 0;
+        }
+
+        int leftPower = (int)(forward + turn + correction);
+        int rightPower = (int)(forward - turn - correction);
+
+        applySlewRate(leftPower, rightPower, prevLeftPower, prevRightPower);
+
+        int calibratedLeft = calibrateMotor(prevLeftPower, LEFT_SIDE_MULTIPLIER);
+        int calibratedRight = calibrateMotor(prevRightPower, RIGHT_SIDE_MULTIPLIER);
+
+        leftMotors.move(calibratedLeft);
+        rightMotors.move(calibratedRight);
+
+        // ----- SUBSYSTEMS ----- //
+        if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L1)) {
+            intakeMotor.move(127);
+            outTakeMotor.move(0);
+        } else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_L2)) {
+            intakeMotor.move(0);
+            outTakeMotor.move(127);
+        } else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1)) {
+            intakeMotor.move(-127);
+            outTakeMotor.move(0);
+        } else if (controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2)) {
+            intakeMotor.move(-127);
+            outTakeMotor.move(127);
+        } else {
+            intakeMotor.move(0);
+            outTakeMotor.move(0);
+        }
+
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)) {
+            matchLoaderState = !matchLoaderState;
+            matchLoader.set_value(matchLoaderState);
+        }
+
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_A)) {
+            switchState = !switchState;
+            switchPiston.set_value(switchState);
+        }
+
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_X)) {
+            descoreState = !descoreState;
+            descore.set_value(descoreState);
+        }
+
+        if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_DOWN)) {
+            referenceHeading = getIMUHeading();
+            controller.rumble(".");
+        }
+
+        updateOdometryFromEncoders();
+
+        uint32_t now = pros::millis();
+        if (now - lastDebugTime > 150) {
+            lastDebugTime = now;
+            pros::lcd::print(1, "Pose (in): X=%.2f Y=%.2f", odom_x_in, odom_y_in);
+            pros::lcd::print(2, "IMU Hdg: %.1f deg", getIMUHeading());
+            pros::lcd::print(3, "Enc deg: L=%.1f R=%.1f", prev_left_deg, prev_right_deg);
+            pros::lcd::print(4, "Pwr: L=%4d R=%4d", prevLeftPower, prevRightPower);
+        }
+
+        pros::delay(20);
+    }
+}
